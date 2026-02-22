@@ -2,11 +2,11 @@ import classNames from 'classnames';
 import {
 	AssertNever,
 	GetLogger,
-	SpaceId,
 	SpaceInvite,
 	SpaceListExtendedInfo,
+	type CharacterId,
 } from 'pandora-common';
-import React, { ReactElement, ReactNode, useMemo } from 'react';
+import React, { ReactElement, useMemo } from 'react';
 import forbiddenIcon from '../../../assets/icons/forbidden.svg';
 import friendsIcon from '../../../assets/icons/friends.svg';
 import lockIcon from '../../../assets/icons/lock.svg';
@@ -21,8 +21,8 @@ import { useDirectoryConnector } from '../../../components/gameContext/directory
 import { usePlayerState } from '../../../components/gameContext/playerContextProvider.tsx';
 import { PersistentToast } from '../../../persistentToast.ts';
 import { useNavigatePandora } from '../../../routing/navigate.ts';
-import { useCurrentAccount } from '../../../services/accountLogic/accountManagerHooks.ts';
-import { useCharacterRestrictionsManager, useGameStateOptional, useSpaceInfoOptional } from '../../../services/gameLogic/gameStateHooks.ts';
+import { useAccountSettings, useCurrentAccount } from '../../../services/accountLogic/accountManagerHooks.ts';
+import { useCharacterRestrictionsManager, useGameStateOptional, useSpaceCharacters, useSpaceInfoOptional } from '../../../services/gameLogic/gameStateHooks.ts';
 import { SPACE_DESCRIPTION_TEXTBOX_SIZE, SPACE_FEATURES } from '../spaceConfiguration/spaceConfigurationDefinitions.tsx';
 import { SpaceOwnershipRemoval } from '../spaceConfiguration/spaceOwnershipRemoval.tsx';
 import { SpaceRoleDropButton } from '../spaceConfiguration/spaceRoleDrop.tsx';
@@ -30,86 +30,17 @@ import './spacesSearch.scss';
 
 const SpaceJoinProgress = new PersistentToast();
 
-export function SpaceDetails({ info, hasFullInfo, hide, invite, closeText = 'Close' }: {
+export function SpaceDetails({ info, hasFullInfo, hide, invite, closeText = 'Close', viewOnly = false }: {
 	info: SpaceListExtendedInfo;
 	hasFullInfo: boolean;
-	hide?: () => void;
+	hide: () => void;
 	invite?: SpaceInvite;
 	closeText?: string;
+	/** If set, the dialog will not offer any options regarded to switching - only display details */
+	viewOnly?: boolean;
 }): ReactElement {
-	const directoryConnector = useDirectoryConnector();
-	const confirm = useConfirmDialog();
 	const contacts = useAccountContacts('friend');
 	const blockedAccounts = useAccountContacts('blocked');
-	const navigate = useNavigatePandora();
-
-	const [join, processing] = useAsyncEvent(
-		async (e: React.MouseEvent<HTMLButtonElement>) => {
-			e.stopPropagation();
-
-			if (info.public === 'locked') {
-				if (!await confirm(
-					'This space is locked',
-					(
-						<>
-							This space appears to be locked from the inside. <br />
-							This is usually done when people inside do not want to be disturbed.<br />
-							Are you sure you want to use your key and enter anyway?
-						</>
-					),
-				)) {
-					return null;
-				}
-			}
-
-			SpaceJoinProgress.show('progress', 'Joining space...');
-			// Hide at this point and navigate to room view to let user see the load progress
-			hide?.();
-			navigate('/room');
-			return directoryConnector.awaitResponse('spaceSwitch', { id: info.id, invite: invite?.id });
-		},
-		(resp) => {
-			if (resp == null)
-				return;
-
-			switch (resp.result) {
-				case 'ok':
-					SpaceJoinProgress.show('success', 'Space joined!');
-					break;
-				case 'failed':
-					SpaceJoinProgress.show('error', 'Error joining the space, try again later');
-					break;
-				case 'notFound':
-					SpaceJoinProgress.show('error', 'Space not found');
-					break;
-				case 'spaceFull':
-					SpaceJoinProgress.show('error', 'Space is full');
-					break;
-				case 'invalidInvite':
-					SpaceJoinProgress.show('error', 'Invalid invite');
-					break;
-				case 'noAccess':
-					SpaceJoinProgress.show('error', 'No access');
-					break;
-				case 'inRoomDevice':
-					SpaceJoinProgress.show('error', 'You must exit the room device before leaving the current space');
-					break;
-				case 'restricted':
-					SpaceJoinProgress.show('error', 'An item is preventing you from leaving the current space');
-					break;
-				default:
-					AssertNever(resp.result);
-			}
-		},
-		{
-			updateAfterUnmount: true,
-			errorHandler: (error) => {
-				GetLogger('JoinSpace').warning('Error during space join', error);
-				SpaceJoinProgress.show('error',
-					`Error during space join:\n${error instanceof Error ? error.message : String(error)}`);
-			},
-		},
-	);
 
 	const userIsOwner = !!info.isOwner;
 	const hasOnlineAdmin = info.characters.some((c) => c.isAdmin && c.isOnline);
@@ -219,43 +150,196 @@ export function SpaceDetails({ info, hasFullInfo, hide, invite, closeText = 'Clo
 					</div>
 				)
 			}
-			<Row padding='medium' className='buttons' alignX='space-between' alignY='center' wrap>
-				{
-					hide && (
-						<Button onClick={ (e) => {
-							e.stopPropagation();
-							hide();
-						} }>
-							{ closeText }
-						</Button>
-					)
-				}
-				{ userIsOwner ? (
-					<SpaceOwnershipRemoval buttonClassName='slim' id={ info.id } name={ info.name } />
-				) : info.isAdmin ? (
-					<SpaceRoleDropButton buttonClassName='slim' id={ info.id } name={ info.name } role='admin' />
-				) : info.isAllowed ? (
-					<SpaceRoleDropButton buttonClassName='slim' id={ info.id } name={ info.name } role='allowlisted' />
-				) : null }
-				<GuardedJoinButton spaceId={ info.id }>
-					<Button
-						disabled={ processing }
-						onClick={ join }>
-						Enter Space
+			{ viewOnly ? (
+				<Row padding='medium' className='buttons' alignX='center' alignY='center' wrap>
+					<Button onClick={ (e) => {
+						e.stopPropagation();
+						hide();
+					} }>
+						{ closeText }
 					</Button>
-				</GuardedJoinButton>
-			</Row>
+				</Row>
+			) : (
+				<Row padding='medium' className='buttons' alignX='space-between' alignY='center' wrap>
+					<Button onClick={ (e) => {
+						e.stopPropagation();
+						hide();
+					} }>
+						{ closeText }
+					</Button>
+					{ userIsOwner ? (
+						<SpaceOwnershipRemoval buttonClassName='slim' id={ info.id } name={ info.name } />
+					) : info.isAdmin ? (
+						<SpaceRoleDropButton buttonClassName='slim' id={ info.id } name={ info.name } role='admin' />
+					) : info.isAllowed ? (
+						<SpaceRoleDropButton buttonClassName='slim' id={ info.id } name={ info.name } role='allowlisted' />
+					) : null }
+					<GuardedJoinButton info={ info } hide={ hide } invite={ invite } />
+				</Row>
+			) }
 		</div>
 	);
 }
 
-function GuardedJoinButton({ children, spaceId }: { children: ReactNode; spaceId: SpaceId; }): ReactElement {
-	const space = useSpaceInfoOptional();
+function GuardedJoinButton({ info, hide, invite }: {
+	info: SpaceListExtendedInfo;
+	hide?: () => void;
+	invite?: SpaceInvite;
+}): ReactElement {
+	const confirm = useConfirmDialog();
+	const navigate = useNavigatePandora();
+	const directoryConnector = useDirectoryConnector();
+
+	const { alwaysUseSpaceSwitchFlow } = useAccountSettings();
+	const currentSpace = useSpaceInfoOptional();
+	const spaceCharacters = useSpaceCharacters();
 
 	const { player, globalState } = usePlayerState();
 	const roomDeviceLink = useCharacterRestrictionsManager(globalState, player, (manager) => manager.getRoomDeviceLink());
 	const canLeave = useCharacterRestrictionsManager(globalState, player, (manager) => (manager.forceAllowRoomLeave() || !manager.getEffects().blockSpaceLeave));
+	const followingCharacters = useMemo((): readonly CharacterId[] => {
+		return Array.from(globalState.characters.values())
+			.filter((c) => c.position.type === 'normal' && c.position.following?.target === player.id)
+			.map((c) => c.id);
+	}, [player, globalState]);
 	const gameState = useGameStateOptional();
+
+	const [join, processingJoin] = useAsyncEvent(
+		async (e: React.MouseEvent<HTMLButtonElement>) => {
+			e.stopPropagation();
+
+			if (info.public === 'locked') {
+				if (!await confirm(
+					'This space is locked',
+					(
+						<>
+							This space appears to be locked from the inside. <br />
+							This is usually done when people inside do not want to be disturbed.<br />
+							Are you sure you want to use your key and enter anyway?
+						</>
+					),
+				)) {
+					return null;
+				}
+			}
+
+			SpaceJoinProgress.show('progress', 'Joining space...');
+			// Hide at this point and navigate to room view to let user see the load progress
+			hide?.();
+			navigate('/room');
+			return directoryConnector.awaitResponse('spaceSwitch', { id: info.id, invite: invite?.id });
+		},
+		(resp) => {
+			if (resp == null)
+				return;
+
+			switch (resp.result) {
+				case 'ok':
+					SpaceJoinProgress.show('success', 'Space joined!');
+					break;
+				case 'failed':
+					SpaceJoinProgress.show('error', 'Error joining the space, try again later');
+					break;
+				case 'notFound':
+					SpaceJoinProgress.show('error', 'Space not found');
+					break;
+				case 'spaceFull':
+					SpaceJoinProgress.show('error', 'Space is full');
+					break;
+				case 'invalidInvite':
+					SpaceJoinProgress.show('error', 'Invalid invite');
+					break;
+				case 'noAccess':
+					SpaceJoinProgress.show('error', 'No access');
+					break;
+				case 'inRoomDevice':
+					SpaceJoinProgress.show('error', 'You must exit the room device before leaving the current space');
+					break;
+				case 'restricted':
+					SpaceJoinProgress.show('error', 'An item is preventing you from leaving the current space');
+					break;
+				default:
+					AssertNever(resp.result);
+			}
+		},
+		{
+			updateAfterUnmount: true,
+			errorHandler: (error) => {
+				GetLogger('JoinSpace').warning('Error during space join', error);
+				SpaceJoinProgress.show('error',
+					`Error during space join:\n${error instanceof Error ? error.message : String(error)}`);
+			},
+		},
+	);
+
+	const [startSwitchProcess, processingSwitch] = useAsyncEvent(
+		async (inviteCharacters: CharacterId[]) => {
+			if (info.public === 'locked') {
+				if (!await confirm(
+					'This space is locked',
+					(
+						<>
+							This space appears to be locked from the inside. <br />
+							This is usually done when people inside do not want to be disturbed.<br />
+							Are you sure you want to use your key and enter anyway?
+						</>
+					),
+				)) {
+					return null;
+				}
+			}
+
+			SpaceJoinProgress.show('progress', 'Requesting space switch...');
+			// Hide at this point and navigate to room view to let user see the load progress
+			hide?.();
+			navigate('/room');
+			return directoryConnector.awaitResponse('spaceSwitchStart', { id: info.id, characters: inviteCharacters });
+		},
+		(resp) => {
+			if (resp == null)
+				return;
+
+			switch (resp.result) {
+				case 'ok':
+					SpaceJoinProgress.hide();
+					break;
+				case 'failed':
+					SpaceJoinProgress.show('error', 'Error joining the space, try again later');
+					break;
+				case 'pendingSwitchExists':
+					SpaceJoinProgress.show('error', 'You are already attempting to switch spaces. Cancel the pending switch first.');
+					break;
+				case 'notFound':
+					SpaceJoinProgress.show('error', 'Space or one of invited characters were not found.');
+					break;
+				case 'noAccess':
+					if (resp.problematicCharacter === player.id) {
+						SpaceJoinProgress.show('error', 'You cannot join this space.');
+					} else {
+						const character = spaceCharacters.find((c) => c.id === resp.problematicCharacter);
+						SpaceJoinProgress.show('error', `Cannot join this space, because ${ character?.data.name ?? '[UNKNOWN]' } (${resp.problematicCharacter}) cannot join this space.`);
+					}
+					break;
+				case 'notAllowed': {
+					const character = spaceCharacters.find((c) => c.id === resp.problematicCharacter);
+					SpaceJoinProgress.show('error', `You are missing permission to invite ${ character?.data.name ?? '[UNKNOWN]' } (${resp.problematicCharacter}).`);
+					break;
+				}
+				default:
+					AssertNever(resp);
+			}
+		},
+		{
+			updateAfterUnmount: true,
+			errorHandler: (error) => {
+				GetLogger('JoinSpace').warning('Error during space join', error);
+				SpaceJoinProgress.show('error',
+					`Error during space join:\n${error instanceof Error ? error.message : String(error)}`);
+			},
+		},
+	);
+
+	const processing = processingJoin || processingSwitch;
 
 	if (!player || !gameState) {
 		return (
@@ -265,11 +349,18 @@ function GuardedJoinButton({ children, spaceId }: { children: ReactNode; spaceId
 		);
 	}
 
-	if (space?.id === null) {
-		return <>{ children }</>;
+	if (currentSpace?.id === null) {
+		return (
+			<Button
+				disabled={ processing }
+				onClick={ join }
+			>
+				Enter Space
+			</Button>
+		);
 	}
 
-	if (space?.id === spaceId) {
+	if (currentSpace?.id === info.id) {
 		return (
 			<Button disabled>
 				You are already inside this space
@@ -293,5 +384,26 @@ function GuardedJoinButton({ children, spaceId }: { children: ReactNode; spaceId
 		);
 	}
 
-	return <>{ children }</>;
+	if (currentSpace?.id != null && (followingCharacters.length > 0 || alwaysUseSpaceSwitchFlow)) {
+		return (
+			<Button
+				disabled={ processing }
+				onClick={ (ev) => {
+					ev.stopPropagation();
+					startSwitchProcess(followingCharacters.slice());
+				} }
+			>
+				Start space invitation
+			</Button>
+		);
+	}
+
+	return (
+		<Button
+			disabled={ processing }
+			onClick={ join }
+		>
+			Enter Space
+		</Button>
+	);
 }

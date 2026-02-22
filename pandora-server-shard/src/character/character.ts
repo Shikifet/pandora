@@ -41,6 +41,7 @@ import {
 	type ChatMessage,
 	type ChatMessageFilterMetadata,
 	type ICharacterDataShard,
+	type SpaceSwitchCharacterStatus,
 } from 'pandora-common';
 import { assetManager } from '../assets/assetManager.ts';
 import { GetDatabase } from '../database/databaseProvider.ts';
@@ -208,6 +209,7 @@ export class Character {
 			} else {
 				AssertNever(type);
 			}
+			this.loadedSpace?.checkSpaceSwitchStatusUpdates();
 		});
 		this.gameLogicCharacter.characterModifiers.on('modifiersChanged', () => {
 			this._emitSomethingChanged('characterModifiers');
@@ -535,6 +537,65 @@ export class Character {
 		);
 
 		return action(processingContext);
+	}
+
+	public checkSpaceSwitchStatus(initiator: Character): Pick<SpaceSwitchCharacterStatus, 'permission' | 'restriction'> {
+		const result: ReturnType<typeof this.checkSpaceSwitchStatus> = {
+			permission: null,
+			restriction: null,
+		};
+
+		const restrictionManager = this.getRestrictionManager();
+
+		// Check if initiator has appropriate permission for space switch
+		if (this.id === initiator.id) {
+			result.permission = 'accept-enforce';
+		} else {
+			const check = initiator.checkAction((ctx) => {
+				const player = ctx.getPlayerRestrictionManager();
+				const checkTarget = ctx.getCharacter(this.id);
+				if (checkTarget == null)
+					return ctx.invalid();
+
+				player.checkInteractWithTarget(ctx, checkTarget.appearance);
+				ctx.addInteraction(checkTarget.character, 'interact');
+
+				return ctx.finalize();
+			});
+
+			if (check.valid) {
+				let autoApprove = false;
+				let enforce = false;
+
+				for (const e of restrictionManager.getModifierEffectsByType('misc_space_switch_auto_approve')) {
+					if (e.config.characters.length === 0 || e.config.characters.includes(initiator.id)) {
+						autoApprove = true;
+						enforce ||= e.config.enforce;
+					}
+				}
+
+				result.permission = enforce ? 'accept-enforce' : autoApprove ? 'accept' : 'prompt';
+			} else {
+				result.permission = 'rejected';
+			}
+		}
+
+		// Check restrictions
+		const inPublicSpace = this.getCurrentPublicSpaceId() != null;
+
+		if (restrictionManager.getRoomDeviceLink() != null) {
+			result.restriction = 'inRoomDevice';
+		} else if (restrictionManager.forceAllowRoomLeave()) {
+			// Skips any checks if force-allow is enabled
+			result.restriction = 'ok';
+		} else if (restrictionManager.getEffects().blockSpaceLeave && inPublicSpace) {
+			// The character must not have leave-restricting effect (this doesn't affect personal spaces)
+			result.restriction = 'restricted';
+		} else {
+			result.restriction = 'ok';
+		}
+
+		return result;
 	}
 
 	@AsyncSynchronized()

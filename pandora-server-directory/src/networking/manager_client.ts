@@ -1,4 +1,4 @@
-import { cloneDeep } from 'lodash-es';
+import { cloneDeep, throttle } from 'lodash-es';
 import { AccountRole, Assert, AssertNever, AssertNotNullable, BadMessageError, ClientDirectoryAuthMessageSchema, GetLogger, IClientDirectory, IClientDirectoryArgument, IClientDirectoryAuthMessage, IClientDirectoryPromiseResult, IClientDirectoryResult, IDirectoryStatus, IMessageHandler, IShardTokenConnectInfo, LIMIT_CHARACTER_COUNT, MessageHandler, Promisable, SecondFactorData, SecondFactorResponse, SecondFactorType, ServerService, type CharacterId, type DirectoryStatusAnnouncement } from 'pandora-common';
 import { SocketInterfaceRequest, SocketInterfaceResponse } from 'pandora-common/networking/helpers';
 import promClient from 'prom-client';
@@ -27,6 +27,8 @@ const {
 
 /** Time (in ms) of how often the directory should send status updates */
 export const STATUS_UPDATE_INTERVAL = 60_000;
+/** Time (in ms) of how often to send space list update notification, at most */
+export const SPACE_LIST_CHANGE_UPDATE_INTERVAL = 30_000;
 
 /**
  * The constant time in milliseconds for the login, register, ...
@@ -129,6 +131,9 @@ export const ConnectionManagerClient = new class ConnectionManagerClient impleme
 			spaceGetInfo: this.handleSpaceGetInfo.bind(this),
 			spaceCreate: this.handleSpaceCreate.bind(this),
 			spaceSwitch: this.handleSpaceSwitch.bind(this),
+			spaceSwitchStart: this.handleSpaceSwitchStart.bind(this),
+			spaceSwitchCommand: this.handleSpaceSwitchCommand.bind(this),
+			spaceSwitchGo: this.handleSpaceSwitchGo.bind(this),
 			spaceUpdate: this.handleSpaceUpdate.bind(this),
 			spaceAdminAction: this.handleSpaceAdminAction.bind(this),
 			spaceDropRole: this.handleSpaceDropRole.bind(this),
@@ -499,11 +504,12 @@ export const ConnectionManagerClient = new class ConnectionManagerClient impleme
 		};
 	}
 
-	private async handleSpaceGetInfo({ id, invite }: IClientDirectoryArgument['spaceGetInfo'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceGetInfo'] {
+	private async handleSpaceGetInfo({ id, invite, invitedBy }: IClientDirectoryArgument['spaceGetInfo'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceGetInfo'] {
 		if (!connection.isLoggedIn() || !connection.character) {
 			return { result: 'noCharacter' };
 		}
 
+		const character = connection.character;
 		const space = await SpaceManager.loadSpace(id);
 
 		if (!space) {
@@ -512,8 +518,29 @@ export const ConnectionManagerClient = new class ConnectionManagerClient impleme
 
 		// Check if the account is allowed to see the details
 		if (!space.checkExtendedInfoVisibleTo(connection.account)) {
+			// If we are invited by someone, check if we can assume valid invitation
+			let assumeValidInvite = false;
+			if (invitedBy != null) {
+				const currentSpace = character.space;
+				if (currentSpace != null) {
+					const invitation = currentSpace.spaceSwitchStatus.find((s) => s.initiator === invitedBy);
+					const invitationInitiator = Array.from(currentSpace.characters).find((c) => c.baseInfo.id === invitedBy);
+					if (invitation != null &&
+						// We are invited to the target space
+						Object.hasOwn(invitation.characters, character.baseInfo.id) &&
+						invitation.targetSpace === space.id &&
+						// Initiator is present, can see the space themselves, and can invite
+						invitationInitiator != null &&
+						space.checkAllowEnter(invitationInitiator, { ignoreCharacterLimit: true }) === 'ok' &&
+						space.canCreateInvite(invitationInitiator, 'joinMe') === 'ok'
+					) {
+						assumeValidInvite = true;
+					}
+				}
+			}
+
 			// Show details if the character can enter anyway (an invite is presented, it might still succeed)
-			const allowResult = space.checkAllowEnter(connection.character, invite, { characterLimit: true });
+			const allowResult = space.checkAllowEnter(connection.character, { inviteId: invite, assumeValidInvite, ignoreCharacterLimit: true });
 
 			if (allowResult !== 'ok') {
 				return { result: 'noAccess' };
@@ -592,6 +619,59 @@ export const ConnectionManagerClient = new class ConnectionManagerClient impleme
 			const result = await character.switchSpace(null);
 			return { result };
 		}
+	}
+
+	private async handleSpaceSwitchStart({ id, characters }: IClientDirectoryArgument['spaceSwitchStart'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceSwitchStart'] {
+		if (!connection.isLoggedIn() || !connection.character)
+			throw new BadMessageError();
+
+		const character = connection.character;
+		const currentSpace = character.space;
+		const targetSpace = await SpaceManager.loadSpace(id);
+
+		if (currentSpace == null) {
+			return { result: 'failed' };
+		}
+		if (targetSpace == null) {
+			return { result: 'notFound' };
+		}
+
+		return await currentSpace.spaceSwitchStart(character, characters, targetSpace);
+	}
+
+	private async handleSpaceSwitchCommand({ initiator, command }: IClientDirectoryArgument['spaceSwitchCommand'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceSwitchCommand'] {
+		if (!connection.isLoggedIn() || !connection.character)
+			throw new BadMessageError();
+
+		const character = connection.character;
+		const currentSpace = character.space;
+
+		if (currentSpace == null) {
+			return { result: 'failed' };
+		}
+
+		const result = await currentSpace.spaceSwitchCommand(character, initiator, command);
+		return { result };
+	}
+
+	private async handleSpaceSwitchGo(_: IClientDirectoryArgument['spaceSwitchGo'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceSwitchGo'] {
+		if (!connection.isLoggedIn() || !connection.character)
+			throw new BadMessageError();
+
+		const character = connection.character;
+		const currentSpace = character.space;
+
+		if (currentSpace == null) {
+			return { result: 'failed' };
+		}
+
+		const coordinator = await currentSpace.spaceSwitchGo(character);
+		if (typeof coordinator === 'string')
+			return { result: coordinator };
+
+		const result = await coordinator.run();
+
+		return { result };
 	}
 
 	private async handleSpaceUpdate(spaceConfig: IClientDirectoryArgument['spaceUpdate'], connection: ClientConnection): IClientDirectoryPromiseResult['spaceUpdate'] {
@@ -1095,13 +1175,17 @@ export const ConnectionManagerClient = new class ConnectionManagerClient impleme
 		}
 	}
 
-	public onSpaceListChange(): void {
+	private readonly _throttledOnSpaceListChange = throttle(() => {
 		for (const connection of this.connectedClients) {
-			// Only send updates to connections that can see the list (have character, but aren't in a public space)
-			if (connection.character && !connection.character.space) {
+			// Only send updates to connections that can see the list (have character)
+			if (connection.character) {
 				connection.sendMessage('somethingChanged', { changes: ['spaceList'] });
 			}
 		}
+	}, SPACE_LIST_CHANGE_UPDATE_INTERVAL);
+
+	public onSpaceListChange(): void {
+		this._throttledOnSpaceListChange();
 	}
 
 	public onShardListChange(): void {
